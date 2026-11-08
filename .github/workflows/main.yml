@@ -1,0 +1,366 @@
+name: Android Development Environment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  ANDROID_HOME: /home/runner/android-sdk
+
+jobs:
+  launch:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    env:
+      VNC_PASS: ${{ secrets.VNC_PASS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yqq --no-install-recommends \
+            openjdk-17-jdk-headless \
+            qemu-kvm \
+            libvirt-daemon-system \
+            xvfb \
+            x11vnc \
+            novnc \
+            websockify \
+            nginx \
+            wget \
+            curl \
+            unzip \
+            python3 \
+            net-tools
+
+      - name: Enable KVM acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
+
+      - name: Install Android SDK command-line tools
+        run: |
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          wget -q \
+            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
+            -O /tmp/ct.zip
+          unzip -q /tmp/ct.zip -d /tmp/ct
+          mv /tmp/ct/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          rm -rf /tmp/ct /tmp/ct.zip
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/emulator"                 >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools"           >> "$GITHUB_PATH"
+
+      - name: Install emulator and system image
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "emulator" \
+            "system-images;android-33;google_apis_playstore;x86_64" \
+            "platforms;android-33"
+
+      - name: Create and configure AVD
+        run: |
+          echo "no" | avdmanager create avd \
+            --name "S23" \
+            --package "system-images;android-33;google_apis_playstore;x86_64" \
+            --device "pixel_6_pro" \
+            --force
+
+          CFG="$HOME/.android/avd/S23.avd/config.ini"
+
+          set_cfg() {
+            local k="$1" v="$2"
+            if grep -q "^${k}=" "$CFG" 2>/dev/null; then
+              sed -i "s|^${k}=.*|${k}=${v}|" "$CFG"
+            else
+              echo "${k}=${v}" >> "$CFG"
+            fi
+          }
+
+          set_cfg hw.ramSize              8192
+          set_cfg hw.cpu.ncore            4
+          set_cfg hw.lcd.width            1080
+          set_cfg hw.lcd.height           2340
+          set_cfg hw.lcd.density          393
+          set_cfg hw.gpu.enabled          yes
+          set_cfg hw.gpu.mode             swiftshader_indirect
+          set_cfg hw.device.manufacturer  Samsung
+          set_cfg hw.device.name          SM-S911B
+          set_cfg disk.dataPartition.size 4G
+          set_cfg PlayStore.enabled       true
+          set_cfg vm.heapSize             512
+          set_cfg fastboot.forceColdBoot  no
+          set_cfg hw.arc                  false
+          set_cfg showDeviceFrame         no
+          set_cfg hw.keyboard             yes
+          set_cfg hw.mainKeys             no
+
+      - name: Start virtual display
+        run: |
+          Xvfb :99 -screen 0 1440x2960x24 -ac &
+          sleep 2
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Boot device and spoof identity
+        run: |
+          export DISPLAY=:99
+
+          nohup emulator \
+            -avd S23 \
+            -no-audio \
+            -no-boot-anim \
+            -no-snapshot \
+            -wipe-data \
+            -writable-system \
+            -gpu swiftshader_indirect \
+            -memory 8192 \
+            -cores 4 \
+            -prop ro.product.model=SM-S911B \
+            -prop ro.product.name=dm1q \
+            -prop ro.product.device=dm1q \
+            -prop ro.product.manufacturer=samsung \
+            -prop ro.product.brand=samsung \
+            -prop ro.board.platform=kalama \
+            -prop ro.hardware=qcom \
+            -prop ro.hardware.chipname=SM8550 \
+            -prop ro.product.cpu.abi=arm64-v8a \
+            -prop ro.hardware.egl=adreno \
+            -prop ro.hardware.vulkan=adreno \
+            -prop ro.opengles.version=196610 \
+            -prop ro.kernel.qemu=0 \
+            -prop ro.boot.qemu=0 \
+            -prop ro.kernel.qemu.gles=0 \
+            > /tmp/emu.log 2>&1 &
+
+          wait_boot() {
+            local timeout="${1:-480}" elapsed=0
+            adb wait-for-device
+            while true; do
+              local s
+              s=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')
+              [ "$s" = "1" ] && { sleep 8; return 0; }
+              [ "$elapsed" -ge "$timeout" ] && return 1
+              sleep 4
+              elapsed=$((elapsed + 4))
+            done
+          }
+
+          echo "==> Boot 1 (initial)"
+          wait_boot 540 || { echo "Boot 1 timeout"; cat /tmp/emu.log | tail -30; exit 1; }
+          echo "Boot 1 complete"
+
+          adb root && sleep 3
+          adb disable-verity 2>&1 || true
+          adb reboot && sleep 14
+
+          echo "==> Boot 2 (post verity-disable)"
+          wait_boot 540 || { echo "Boot 2 timeout"; exit 1; }
+          echo "Boot 2 complete"
+
+          adb root && sleep 3
+          adb remount && sleep 2
+
+          patch_prop() {
+            local k="$1" v="$2" f="/tmp/bp.txt"
+            if grep -q "^${k}=" "$f"; then
+              sed -i "s|^${k}=.*|${k}=${v}|" "$f"
+            else
+              printf '%s=%s\n' "$k" "$v" >> "$f"
+            fi
+          }
+
+          adb pull /system/build.prop /tmp/bp.txt
+
+          # Device identity — Samsung Galaxy S23
+          patch_prop ro.product.model              SM-S911B
+          patch_prop ro.product.name               dm1q
+          patch_prop ro.product.device             dm1q
+          patch_prop ro.product.manufacturer       samsung
+          patch_prop ro.product.brand              samsung
+          patch_prop ro.product.marketname         "Galaxy S23"
+          patch_prop ro.product.system.model       SM-S911B
+          patch_prop ro.product.system.name        dm1q
+          patch_prop ro.product.system.manufacturer samsung
+          patch_prop ro.product.system.brand       samsung
+          patch_prop ro.product.vendor.model       SM-S911B
+          patch_prop ro.product.odm.model          SM-S911B
+
+          # Snapdragon 8 Gen 2 — SM8550 on kalama platform
+          patch_prop ro.board.platform             kalama
+          patch_prop ro.hardware                   qcom
+          patch_prop ro.hardware.chipname          SM8550
+
+          # CPU ABI — ARM64, Cortex-compatible list
+          patch_prop ro.product.cpu.abi            arm64-v8a
+          patch_prop ro.product.cpu.abilist        arm64-v8a,armeabi-v7a,armeabi
+          patch_prop ro.product.cpu.abilist32      armeabi-v7a,armeabi
+          patch_prop ro.product.cpu.abilist64      arm64-v8a
+
+          # Adreno 740 GPU identity
+          patch_prop ro.hardware.egl               adreno
+          patch_prop ro.hardware.vulkan            adreno
+          patch_prop ro.opengles.version           196610
+          patch_prop ro.vendor.qcom.gpu.model      "Adreno (TM) 740"
+          patch_prop ro.vendor.qcom.gpu.version    512
+          patch_prop ro.gfx.driver.0               com.qti.feature2.standalone
+
+          # 120 Hz display
+          patch_prop ro.vendor.display.mode_change_optimize.enable true
+          patch_prop ro.surface_flinger.set_idle_timer_ms          100
+          patch_prop ro.surface_flinger.max_frame_buffer_acquired_buffers 4
+
+          # Samsung One UI fingerprint
+          patch_prop ro.build.fingerprint \
+            samsung/dm1q/dm1q:13/TP1A.220624.014/S911BXXS3DWL1:user/release-keys
+          patch_prop ro.build.version.release      13
+          patch_prop ro.build.version.sdk          33
+          patch_prop ro.build.version.security_patch 2023-12-01
+
+          # Erase emulator fingerprints
+          patch_prop ro.kernel.qemu                0
+          patch_prop ro.boot.qemu                  0
+          patch_prop ro.kernel.qemu.gles           0
+
+          adb push /tmp/bp.txt /system/build.prop
+          adb shell chmod 644 /system/build.prop
+
+          # Vendor build.prop for Adreno GPU model string
+          adb pull /vendor/build.prop /tmp/vbp.txt 2>/dev/null || touch /tmp/vbp.txt
+          patch_vp() {
+            local k="$1" v="$2" f="/tmp/vbp.txt"
+            grep -q "^${k}=" "$f" && \
+              sed -i "s|^${k}=.*|${k}=${v}|" "$f" || \
+              printf '%s=%s\n' "$k" "$v" >> "$f"
+          }
+          patch_vp ro.vendor.qcom.gpu.model   "Adreno (TM) 740"
+          patch_vp ro.vendor.qcom.gpu.version 512
+          adb push /tmp/vbp.txt /vendor/build.prop || true
+
+          # Reboot — props baked
+          adb reboot && sleep 14
+
+          echo "==> Boot 3 (final, props active)"
+          wait_boot 540 || { echo "Boot 3 timeout"; exit 1; }
+          echo "Boot 3 complete"
+
+          # Post-boot runtime settings
+          adb shell settings put global device_name "Galaxy S23" 2>/dev/null || true
+          adb shell setprop persist.sys.locale en-US 2>/dev/null || true
+          adb shell wm density 393 2>/dev/null || true
+
+          echo "Identity spoofing complete."
+
+      - name: Configure nginx gateway
+        run: |
+          sudo tee /etc/nginx/sites-available/novnc > /dev/null << 'NGXEOF'
+          server {
+              listen 7080;
+
+              location = /validate {
+                  internal;
+                  proxy_pass         http://127.0.0.1:7081/validate;
+                  proxy_pass_request_body off;
+                  proxy_set_header   Content-Length "";
+                  proxy_set_header   Cookie $http_cookie;
+              }
+
+              location ~ ^/login {
+                  proxy_pass         http://127.0.0.1:7081;
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+              }
+
+              error_page 401 = @go_login;
+              location @go_login {
+                  return 302 /login;
+              }
+
+              location / {
+                  auth_request /validate;
+
+                  proxy_pass           http://127.0.0.1:6080;
+                  proxy_http_version   1.1;
+                  proxy_set_header     Upgrade $http_upgrade;
+                  proxy_set_header     Connection "upgrade";
+                  proxy_set_header     Host $host;
+                  proxy_read_timeout   86400;
+                  proxy_send_timeout   86400;
+                  proxy_buffering      off;
+              }
+          }
+          NGXEOF
+
+          sudo ln -sf /etc/nginx/sites-available/novnc \
+                      /etc/nginx/sites-enabled/novnc
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t
+          sudo systemctl restart nginx
+
+      - name: Start remote access stack
+        run: |
+          export DISPLAY=:99
+
+          nohup x11vnc \
+            -display :99 \
+            -forever \
+            -nopw \
+            -listen 127.0.0.1 \
+            -rfbport 5900 \
+            -shared \
+            -quiet \
+            > /tmp/x11vnc.log 2>&1 &
+
+          sleep 2
+
+          nohup websockify \
+            --web=/usr/share/novnc \
+            --quiet \
+            6080 \
+            127.0.0.1:5900 \
+            > /tmp/ws.log 2>&1 &
+
+          sleep 2
+
+          nohup python3 gate.py > /tmp/gate.log 2>&1 &
+
+          sleep 3
+
+          wget -q \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb" \
+            -O /tmp/cf.deb
+          sudo dpkg -i /tmp/cf.deb
+          rm /tmp/cf.deb
+
+          nohup cloudflared tunnel \
+            --url http://localhost:7080 \
+            --no-autoupdate \
+            > /tmp/cf.log 2>&1 &
+
+          for _ in $(seq 1 50); do
+            URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' \
+                  /tmp/cf.log 2>/dev/null | head -1)
+            if [ -n "$URL" ]; then
+              echo ""
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "  Remote URL : $URL"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Maintain session
+        run: |
+          echo "Session active — max ~345 min remaining."
+          sleep 20700
